@@ -27,6 +27,9 @@ import torch
 import torch.distributed as dist
 from torch import inf
 import h5py
+import moabb
+from moabb.datasets import BNCI2014_001
+from moabb.paradigms import MotorImagery
 
 from tensorboardX import SummaryWriter
 from data_processor.dataset import ShockDataset
@@ -800,6 +803,76 @@ def prepare_TUAB_dataset(root):
     test_dataset = TUABLoader(os.path.join(root, "test"), test_files)
     val_dataset = TUABLoader(os.path.join(root, "val"), val_files)
     print(len(train_files), len(val_files), len(test_files))
+    return train_dataset, test_dataset, val_dataset
+
+class MotorImageryDataset(torch.utils.data.Dataset):
+    def __init__(self, X, labels, transform=None):
+        """
+        Args:
+            X (np.array): EEG data array.
+            labels (np.array): Corresponding labels for the EEG data.
+            transform (callable, optional): Optional transform to apply to data.
+        """
+        self.X = X
+        self.label_map = {"tongue": 0, "feet": 1, "right_hand": 2, "left_hand": 3}
+        self.labels = [self.label_map[label] for label in labels]
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        sample = self.X[idx]
+        label = self.labels[idx]
+
+        # Apply any transformation if specified
+        if self.transform:
+            sample = self.transform(sample)
+
+        # Convert sample and label to torch tensors
+        sample = torch.tensor(sample, dtype=torch.float32)
+        label = torch.tensor(label, dtype=torch.long)
+        return sample, label
+
+def prepare_BNCI_dataset():
+    # set random seed
+    seed = 4523
+    np.random.seed(seed)
+    moabb.set_log_level("ERROR")
+    paradigm = MotorImagery(n_classes=4)
+    dataset = BNCI2014_001()
+    # subjects = [1]
+    X, labels, meta = paradigm.get_data(dataset=dataset)
+    
+    # Calculate split sizes
+    total_samples = len(X)
+    train_size = int(0.8 * total_samples)
+    val_size = int(0.1 * total_samples)
+    test_size = total_samples - train_size - val_size
+    
+    # Create indices for random splitting
+    indices = np.random.permutation(total_samples)
+    train_indices = indices[:train_size]
+    val_indices = indices[train_size:train_size + val_size]
+    test_indices = indices[train_size + val_size:]
+    
+    # Split data using indices
+    X_train = X[train_indices]
+    y_train = labels[train_indices]
+    X_val = X[val_indices]
+    y_val = labels[val_indices]
+    X_test = X[test_indices]
+    y_test = labels[test_indices]
+    
+    # Create datasets
+    train_dataset = MotorImageryDataset(X_train, y_train)
+    val_dataset = MotorImageryDataset(X_val, y_val)
+    test_dataset = MotorImageryDataset(X_test, y_test)
+    
+    print(f"Train samples: {len(train_dataset)}")  # Should be ~460 (80%)
+    print(f"Val samples: {len(val_dataset)}")      # Should be ~58 (10%)
+    print(f"Test samples: {len(test_dataset)}")    # Should be ~58 (10%)
+    
     return train_dataset, test_dataset, val_dataset
 
 

@@ -252,7 +252,7 @@ class TemporalConv(nn.Module):
     def forward(self, x, **kwargs):
         x = rearrange(x, 'B N A T -> B (N A) T')
         B, NA, T = x.shape
-        x = x.unsqueeze(1)
+        x = x.unsqueeze(1).float()
         x = self.gelu1(self.norm1(self.conv1(x)))
         x = self.gelu2(self.norm2(self.conv2(x)))
         x = self.gelu3(self.norm3(self.conv3(x)))

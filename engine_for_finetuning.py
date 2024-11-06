@@ -32,6 +32,11 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     model_ema: Optional[ModelEma] = None, log_writer=None,
                     start_steps=None, lr_schedule_values=None, wd_schedule_values=None,
                     num_training_steps_per_epoch=None, update_freq=None, ch_names=None, is_binary=True):
+    # Add device check at the start of the function
+    if torch.cuda.is_available():
+        model.cuda()
+    else:
+        model = model.cpu()
     input_chans = None
     if ch_names is not None:
         input_chans = utils.get_input_chans(ch_names)
@@ -62,6 +67,9 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     param_group["weight_decay"] = wd_schedule_values[it]
 
         samples = samples.float().to(device, non_blocking=True) / 100
+        time_len = samples.shape[-1]
+        truncated_len = (time_len // 200) * 200
+        samples = samples[..., :truncated_len]
         samples = rearrange(samples, 'B N (A T) -> B N A T', T=200)
         
         targets = targets.to(device, non_blocking=True)
@@ -69,9 +77,10 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             targets = targets.float().unsqueeze(-1)
 
         if loss_scaler is None:
-            samples = samples.half()
-            loss, output = train_class_batch(
-                model, samples, targets, criterion, input_chans)
+            # samples = samples.half()
+            with torch.cpu.amp.autocast():
+                loss, output = train_class_batch(
+                    model, samples, targets, criterion, input_chans)
         else:
             with torch.cuda.amp.autocast():
                 loss, output = train_class_batch(
@@ -85,16 +94,16 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
         if loss_scaler is None:
             loss /= update_freq
-            model.backward(loss)
-            model.step()
+            loss.backward()
+            optimizer.step()
 
             if (data_iter_step + 1) % update_freq == 0:
-                # model.zero_grad()
-                # Deepspeed will call step() & model.zero_grad() automatic
+                optimizer.zero_grad()
                 if model_ema is not None:
                     model_ema.update(model)
             grad_norm = None
-            loss_scale_value = get_loss_scale_for_deepspeed(model)
+            # loss_scale_value = get_loss_scale_for_deepspeed(model)
+            loss_scale_value = optimizer.loss_scale if hasattr(optimizer, "loss_scale") else 0
         else:
             # this attribute is added by timm on one optimizer (adahessian)
             is_second_order = hasattr(optimizer, 'is_second_order') and optimizer.is_second_order
@@ -108,7 +117,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     model_ema.update(model)
             loss_scale_value = loss_scaler.state_dict()["scale"]
 
-        torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
 
         if is_binary:
             class_acc = utils.get_metrics(torch.sigmoid(output).detach().cpu().numpy(), targets.detach().cpu().numpy(), ["accuracy"], is_binary)["accuracy"]
@@ -152,6 +162,11 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
 @torch.no_grad()
 def evaluate(data_loader, model, device, header='Test:', ch_names=None, metrics=['acc'], is_binary=True):
+    # Add device check at the start of the function
+    if torch.cuda.is_available():
+        model.cuda()
+    else:
+        model = model.to(device)
     input_chans = None
     if ch_names is not None:
         input_chans = utils.get_input_chans(ch_names)
@@ -171,15 +186,24 @@ def evaluate(data_loader, model, device, header='Test:', ch_names=None, metrics=
         EEG = batch[0]
         target = batch[-1]
         EEG = EEG.float().to(device, non_blocking=True) / 100
+
+        time_len = EEG.shape[-1]
+        truncated_len = (time_len // 200) * 200
+        EEG = EEG[..., :truncated_len]
         EEG = rearrange(EEG, 'B N (A T) -> B N A T', T=200)
         target = target.to(device, non_blocking=True)
         if is_binary:
             target = target.float().unsqueeze(-1)
         
         # compute output
-        with torch.cuda.amp.autocast():
-            output = model(EEG, input_chans=input_chans)
-            loss = criterion(output, target)
+        if torch.cuda.is_available():
+            with torch.cuda.amp.autocast():
+                output = model(EEG, input_chans=input_chans)
+                loss = criterion(output, target)
+        else:
+            with torch.cpu.amp.autocast():
+                output = model(EEG, input_chans=input_chans).float()
+                loss = criterion(output, target).float()
         
         if is_binary:
             output = torch.sigmoid(output).cpu()

@@ -225,24 +225,39 @@ def get_dataset(args):
         ch_names = [name.split(' ')[-1].split('-')[0] for name in ch_names]
         args.nb_classes = 6
         metrics = ["accuracy", "balanced_accuracy", "cohen_kappa", "f1_weighted"]
+    elif args.dataset == 'BNCI':
+        train_dataset, test_dataset, val_dataset = utils.prepare_BNCI_dataset()
+        ch_names = [
+            "Fz", "FC3", "FC1", "FCz", "FC2", "FC4", "C5", "C3", "C1", "Cz", "C2",
+            "C4", "C6", "CP3", "CP1", "CPz", "CP2", "CP4", "P1", "Pz", "P2", "POz"
+        ]
+        ch_names = [c.upper() for c in ch_names]
+        args.nb_classes = 4
+        metrics = ["accuracy", "balanced_accuracy", "f1_weighted"]
     return train_dataset, test_dataset, val_dataset, ch_names, metrics
 
 
 def main(args, ds_init):
-    utils.init_distributed_mode(args)
+    # Modify the device initialization
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        utils.init_distributed_mode(args)
+    else:
+        device = torch.device("cpu")
+        args.distributed = False
+        args.device = "cpu"
+        print("Using CPU. This will be slow.")
 
     if ds_init is not None:
         utils.create_ds_config(args)
 
+    args.dataset = 'BNCI'
+    args.finetune = 'checkpoints/labram-base.pth'
+    args.eval = True
+    args.abs_pos_emb = True
+    args.weight_decay = False
+    # args.resume = 'checkpoints/labram-base.pth'
     print(args)
-
-    device = torch.device(args.device)
-
-    # fix the seed for reproducibility
-    seed = args.seed + utils.get_rank()
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    # random.seed(seed)
 
     cudnn.benchmark = True
 
@@ -255,7 +270,7 @@ def main(args, ds_init):
         dataset_val = None
         dataset_test = None
 
-    if True:  # args.distributed:
+    if args.distributed:  # args.distributed:
         num_tasks = utils.get_world_size()
         global_rank = utils.get_rank()
         sampler_train = torch.utils.data.DistributedSampler(
@@ -279,6 +294,8 @@ def main(args, ds_init):
             sampler_val = torch.utils.data.SequentialSampler(dataset_val)
             sampler_test = torch.utils.data.SequentialSampler(dataset_test)
     else:
+        global_rank = 1
+        sampler_test = torch.utils.data.RandomSampler(dataset_test)
         sampler_train = torch.utils.data.RandomSampler(dataset_train)
         sampler_val = torch.utils.data.SequentialSampler(dataset_val)
 
@@ -313,13 +330,13 @@ def main(args, ds_init):
                 drop_last=False
             ) for dataset, sampler in zip(dataset_test, sampler_test)]
         else:
-            data_loader_test = torch.utils.data.DataLoader(
+            data_loader_test = [torch.utils.data.DataLoader(
                 dataset_test, sampler=sampler_test,
                 batch_size=int(1.5 * args.batch_size),
                 num_workers=args.num_workers,
                 pin_memory=args.pin_mem,
                 drop_last=False
-            )
+            )]
     else:
         data_loader_val = None
         data_loader_test = None
@@ -431,7 +448,7 @@ def main(args, ds_init):
             args, model_without_ddp, skip_list=skip_weight_decay_list,
             get_num_layer=assigner.get_layer_id if assigner is not None else None, 
             get_layer_scale=assigner.get_scale if assigner is not None else None)
-        loss_scaler = NativeScaler()
+        loss_scaler = NativeScaler() if torch.cuda.is_available() else None
 
     print("Use step level LR scheduler!")
     lr_schedule_values = utils.cosine_scheduler(
@@ -471,13 +488,14 @@ def main(args, ds_init):
     start_time = time.time()
     max_accuracy = 0.0
     max_accuracy_test = 0.0
-    for epoch in range(args.start_epoch, args.epochs):
+    # for epoch in range(args.start_epoch, args.epochs):
+    for epoch in range(1):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
         if log_writer is not None:
             log_writer.set_step(epoch * num_training_steps_per_epoch * args.update_freq)
         train_stats = train_one_epoch(
-            model, criterion, data_loader_train, optimizer,
+            model_without_ddp, criterion, data_loader_train, optimizer,
             device, epoch, loss_scaler, args.clip_grad, model_ema,
             log_writer=log_writer, start_steps=epoch * num_training_steps_per_epoch,
             lr_schedule_values=lr_schedule_values, wd_schedule_values=wd_schedule_values,
@@ -491,9 +509,9 @@ def main(args, ds_init):
                 loss_scaler=loss_scaler, epoch=epoch, model_ema=model_ema, save_ckpt_freq=args.save_ckpt_freq)
             
         if data_loader_val is not None:
-            val_stats = evaluate(data_loader_val, model, device, header='Val:', ch_names=ch_names, metrics=metrics, is_binary=args.nb_classes == 1)
+            val_stats = evaluate(data_loader_val, model_without_ddp, device, header='Val:', ch_names=ch_names, metrics=metrics, is_binary=args.nb_classes == 1)
             print(f"Accuracy of the network on the {len(dataset_val)} val EEG: {val_stats['accuracy']:.2f}%")
-            test_stats = evaluate(data_loader_test, model, device, header='Test:', ch_names=ch_names, metrics=metrics, is_binary=args.nb_classes == 1)
+            test_stats = evaluate(data_loader_test[0], model_without_ddp, device, header='Test:', ch_names=ch_names, metrics=metrics, is_binary=args.nb_classes == 1)
             print(f"Accuracy of the network on the {len(dataset_test)} test EEG: {test_stats['accuracy']:.2f}%")
             
             if max_accuracy < val_stats["accuracy"]:
